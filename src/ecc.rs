@@ -8,7 +8,7 @@ use crate::{
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::{thread, time::Duration};
 
 pub use crate::command::KeyType;
 
@@ -212,13 +212,13 @@ impl Ecc {
             &EccCommand::nonce(DataBuffer::MessageDigest, Bytes::copy_from_slice(&digest)),
             true,
             false,
-            1,
+            0,
         )?;
         self.send_command_retries(
             &EccCommand::sign(DataBuffer::MessageDigest, key_slot),
             false,
             true,
-            1,
+            0,
         )
     }
 
@@ -263,7 +263,7 @@ impl Ecc {
         let delay = self.config.command_duration(command);
         let wake_delay = Duration::from_micros(self.config.wake_delay as u64);
 
-        for retry in 0..retries {
+        for retry in 0..=retries {
             buf.clear();
             buf.put_u8(self.transport.put_command_flag());
             command.bytes_into(&mut buf);
@@ -274,8 +274,6 @@ impl Ecc {
 
             if let Err(_err) = self.transport.send_recv_buf(delay, &mut buf) {
                 if retry == retries {
-                    // Sleep the chip to clear the SRAM when the maximum error retries have been exhausted
-                    self.transport.send_sleep();
                     break;
                 } else {
                     continue;
@@ -289,9 +287,28 @@ impl Ecc {
             match response {
                 EccResponse::Data(bytes) => return Ok(bytes),
                 EccResponse::Error(err) if err.is_recoverable() && retry < retries => continue,
-                EccResponse::Error(err) => return Err(Error::ecc(err)),
+                EccResponse::Error(err) => {
+                    self.error_mitigation();
+                    return Err(Error::ecc(err));
+                }
             }
         }
+        self.error_mitigation();
         Err(Error::timeout())
+    }
+
+    fn error_mitigation(&mut self) {
+        // Error mitigation sequence;
+        // 1. Wait to make sure any command it may have still been executed completed
+        // 2. Sleep chip to clear SRAM
+        // 3. Wake chip up again
+        // 4. Put chip in idle
+        let wake_delay = Duration::from_micros(self.config.wake_delay as u64);
+        thread::sleep(Duration::from_millis(150));
+        self.transport.send_sleep();
+        thread::sleep(2 * wake_delay);
+        let _ = self.transport.send_wake(wake_delay);
+        thread::sleep(2 * wake_delay);
+        self.transport.send_idle();
     }
 }
